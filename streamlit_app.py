@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-# 3分無料診断（JST / 1ページPDF最適化 / AIコメント自動生成）
-# - 設問10問 → スコア化 → 6タイプ判定 → 信号色表示
-# - PDF出力（日本語TTF埋め込み、棒グラフ、ロゴ・QR最適化、1ページ収まり強化）
-# - ログ保存（Google Sheets / CSV）
-# - OpenAIで“約300字”のAIコメントを自動生成（Secrets/環境変数両対応）
-# - ロゴはローカル優先（assets/CImark.png）→ 失敗時はURL取得
+# 3分無料診断（必須入力＋自動保存＋UTM保存 / JST / 1ページPDF / AIコメント自動生成）
+# - 会社名・メールを必須化（未入力や不正形式は診断ストップ）
+# - 診断完了時に自動保存：Google Sheets が設定されていればSheets、無ければCSVに追記
+# - UTM（source/medium/campaign）をクエリから取得し、ログに同時保存
+# - それ以外は従来通り：PDF（日本語TTF/ロゴ/QR/棒グラフ）、AIコメント自動生成
 
 import os
 import io
+import re
 import json
 import time
 import tempfile
@@ -41,7 +41,7 @@ from google.oauth2.service_account import Credentials
 
 # ========= ブランド & 定数 =========
 BRAND_BG = "#f0f7f7"
-LOGO_LOCAL = "assets/CImark.png"  # GitHub/Streamlit Cloud用
+LOGO_LOCAL = "assets/CImark.png"
 LOGO_URL   = "https://victorconsulting.jp/wp-content/uploads/2025/10/CImark.png"
 CTA_URL    = "https://victorconsulting.jp/spot-diagnosis/"
 OPENAI_MODEL = "gpt-4o-mini"
@@ -63,11 +63,22 @@ st.set_page_config(
 defaults = {
     "result_ready": False, "df": None, "overall_avg": None, "signal": None,
     "main_type": None, "company": "", "email": "",
-    "ai_comment": None, "ai_tried": False
+    "ai_comment": None, "ai_tried": False,
+    "utm_source": "", "utm_medium": "", "utm_campaign": ""
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ========= UTMの取得（クエリ文字列）=========
+# Streamlit Cloudは st.query_params でOK（旧APIは experimental_get_query_params）
+try:
+    q = st.query_params
+except Exception:
+    q = st.experimental_get_query_params()  # 互換
+st.session_state["utm_source"]   = q.get("utm_source",   [""])[0] if isinstance(q.get("utm_source"), list) else q.get("utm_source", "")
+st.session_state["utm_medium"]   = q.get("utm_medium",   [""])[0] if isinstance(q.get("utm_medium"), list) else q.get("utm_medium", "")
+st.session_state["utm_campaign"] = q.get("utm_campaign", [""])[0] if isinstance(q.get("utm_campaign"), list) else q.get("utm_campaign", "")
 
 # ========= Secrets/環境変数 =========
 def read_secret(key: str, default=None):
@@ -144,13 +155,25 @@ def path_or_download_logo() -> str | None:
 with st.sidebar:
     logo_path = path_or_download_logo()
     if logo_path:
-        st.image(logo_path, width=150)  # 少し小さめ
+        st.image(logo_path, width=150)
     st.markdown("### 3分無料診断")
     st.markdown("- 入力は Yes/部分的/No と 5段階のみ\n- 機密数値は不要\n- 結果は 6タイプ＋赤/黄/青")
     st.caption("© Victor Consulting")
 
 st.title("製造現場の“隠れたムダ”をあぶり出す｜3分無料診断")
 st.write("**10問**に回答するだけで、貴社のリスク“構造”を可視化します。")
+
+# ========= バリデーション =========
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+def validate_inputs(company: str, email: str) -> tuple[bool, str]:
+    if not company.strip():
+        return False, "会社名は必須です。"
+    if not email.strip():
+        return False, "メールアドレスは必須です。"
+    if not EMAIL_RE.match(email.strip()):
+        return False, "メールアドレスの形式が正しくありません。"
+    return True, ""
 
 # ========= 設問 UI =========
 YN3 = ["Yes", "部分的に", "No"]
@@ -178,8 +201,10 @@ with st.form("diagnose_form"):
     q10 = st.radio("Q10. データをもとに経営会議や現場ミーティングを行っていますか？", YN3, index=1)
 
     st.markdown("---")
-    company = st.text_input("会社名（任意）", value=st.session_state["company"])
-    email   = st.text_input("メールアドレス（任意｜Phase 4で利用）", value=st.session_state["email"])
+    company = st.text_input("会社名（必須）", value=st.session_state["company"])
+    email   = st.text_input("メールアドレス（必須）", value=st.session_state["email"])
+    st.caption("※ 入力いただいた会社名・メールは診断ログとして保存されます（営業目的以外には利用しません）。")
+
     submitted = st.form_submit_button("診断する")
 
 # ========= スコア関数 =========
@@ -220,9 +245,28 @@ def fallback_append_to_csv(row_dict: dict, csv_path="responses.csv"):
     else:
         df.to_csv(csv_path, index=False, encoding="utf-8")
 
+def auto_save_row(row: dict):
+    # 優先：SecretsのSheets設定 → 無ければCSV
+    secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
+    secret_sheet_id = read_secret("SPREADSHEET_ID", None)
+    try:
+        if secret_json and secret_sheet_id:
+            try_append_to_google_sheets(row, secret_sheet_id, secret_json)
+            st.info("診断ログをGoogle Sheetsに保存しました。")
+        else:
+            fallback_append_to_csv(row)
+            st.info("診断ログをCSV（responses.csv）に保存しました。")
+    except Exception as e:
+        # 失敗時はCSVへフォールバック
+        try:
+            fallback_append_to_csv(row)
+            st.warning(f"Sheets保存に失敗したため、CSVに保存しました。詳細: {e}")
+        except Exception as e2:
+            st.error(f"ログ保存でエラーが発生しました: {e2}")
+
 # ========= 図・QRユーティリティ =========
 def build_bar_png(df: pd.DataFrame) -> bytes:
-    fig, ax = plt.subplots(figsize=(5.0, 2.4), dpi=220)  # 小型化
+    fig, ax = plt.subplots(figsize=(5.0, 2.4), dpi=220)
     df_sorted = df.sort_values("平均スコア", ascending=True)
     ax.barh(df_sorted["カテゴリ"], df_sorted["平均スコア"])
     ax.set_xlim(0, 5)
@@ -312,7 +356,7 @@ def generate_ai_comment(company: str, main_type: str, df_scores: pd.DataFrame, o
 def clamp_comment(text: str, max_chars: int = CLAMP_CHAR_LIMIT) -> str:
     if not text:
         return ""
-    t = " ".join(text.strip().split())  # 改行や連続空白を正規化
+    t = " ".join(text.strip().split())
     return t if len(t) <= max_chars else (t[:max_chars - 1] + "…")
 
 # ========= PDF生成 =========
@@ -322,7 +366,6 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     qr_png  = build_qr_png(CTA_URL)
 
     buf = io.BytesIO()
-    # 余白を小さくして可視領域を拡大（1ページ収まり強化）
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         rightMargin=32, leftMargin=32, topMargin=28, bottomMargin=28
@@ -332,14 +375,12 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     title = styles["Title"]; normal = styles["BodyText"]; h3 = styles["Heading3"]
     if FONT_PATH_IN_USE:
         title.fontName = normal.fontName = h3.fontName = "JP"
-    # 本文をやや詰める
     normal.fontSize = 10
     normal.leading = 14
     h3.spaceBefore = 6
     h3.spaceAfter = 4
 
     elems = []
-    # ロゴ（小型化）
     if logo_path:
         elems.append(image_with_max_width(logo_path, max_w=120))
         elems.append(Spacer(1, 6))
@@ -359,11 +400,10 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     elems.append(Paragraph(clamp_comment(result["comment"], CLAMP_CHAR_LIMIT), normal))
     elems.append(Spacer(1, 6))
 
-    # 表
     table_data = [["カテゴリ", "平均スコア（0-5）"]] + [
         [r["カテゴリ"], f"{r['平均スコア']:.2f}"] for _, r in df_scores.iterrows()
     ]
-    tbl = Table(table_data, colWidths=[220, 140])  # 少し詰める
+    tbl = Table(table_data, colWidths=[220, 140])
     style_list = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(brand_hex)),
         ("TEXTCOLOR",  (0, 0), (-1, 0), colors.black),
@@ -377,25 +417,20 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
     elems.append(tbl)
     elems.append(Spacer(1, 6))
 
-    # 棒グラフ（微縮小）
     bar_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     bar_tmp.write(bar_png); bar_tmp.flush()
     elems.append(Paragraph("カテゴリ別スコア（棒グラフ）", h3))
     elems.append(Image(bar_tmp.name, width=390, height=180))
     elems.append(Spacer(1, 6))
 
-    # 「次の一手」：左に文言、右にQR（QRも小型化）
+    # 次の一手（QR）
     elems.append(Paragraph("次の一手（90分スポット診断のご案内）", h3))
     url_par = Paragraph(f"詳細・お申込み：<u>{CTA_URL}</u>", normal)
     qr_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     qr_tmp.write(qr_png); qr_tmp.flush()
-    qr_img = Image(qr_tmp.name, width=52, height=52)  # 56→52
-
+    qr_img = Image(qr_tmp.name, width=52, height=52)
     next_table = Table([[url_par, qr_img]], colWidths=[430, 70])
-    nt_style = [
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN",  (1, 0), (1, 0), "RIGHT"),
-    ]
+    nt_style = [("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (1, 0), (1, 0), "RIGHT")]
     if FONT_PATH_IN_USE:
         nt_style.append(("FONTNAME", (0, 0), (-1, -1), "JP"))
     next_table.setStyle(TableStyle(nt_style))
@@ -407,6 +442,12 @@ def make_pdf_bytes(result: dict, df_scores: pd.DataFrame, brand_hex=BRAND_BG) ->
 
 # ========= 計算＆セッション保存 =========
 if submitted:
+    # 必須チェック
+    ok, msg = validate_inputs(company, email)
+    if not ok:
+        st.error(msg)
+        st.stop()
+
     inv_scores    = [to_score_yn3(q1), to_score_yn3(q2)]
     skills_scores = [to_score_yn3(q3, invert=True), to_score_yn3(q4)]
     cost_scores   = [to_score_yn3(q5), to_score_5scale(q6)]
@@ -521,48 +562,27 @@ if st.session_state.get("result_ready"):
     fname = f"VC_診断_{company or '匿名'}_{datetime.now(JST).strftime('%Y%m%d_%H%M')}.pdf"
     st.download_button("📄 PDFをダウンロード", data=pdf_bytes, file_name=fname, mime="application/pdf")
 
-    # ログ保存（Sheets or CSV）
-    with st.expander("管理者向け：ログ保存（Google Sheets / CSV）"):
-        st.write("※ Google Sheets のサービスアカウントJSONとスプレッドシートIDがあれば、直接保存できます。無い場合はCSVに追記します。")
-        secret_json     = read_secret("GOOGLE_SERVICE_JSON", None)
-        secret_sheet_id = read_secret("SPREADSHEET_ID", None)
-
-        sheet_id = st.text_input("スプレッドシートID（1A2B... の長いID）", value=secret_sheet_id or "")
-        json_text = st.text_area("サービスアカウントJSON（貼り付け）", value=secret_json or "", height=140)
-
-        row = {
-            "timestamp": datetime.now(JST).isoformat(timespec="seconds"),
-            "company": company, "email": email,
-            "signal": signal[0], "main_type": main_type,
-            "overall_avg": f"{overall_avg:.2f}",
-            "inv_avg": f"{df.loc[df['カテゴリ']=='在庫・運搬','平均スコア'].values[0]:.2f}",
-            "skills_avg": f"{df.loc[df['カテゴリ']=='人材・技能承継','平均スコア'].values[0]:.2f}",
-            "cost_avg": f"{df.loc[df['カテゴリ']=='原価意識・改善文化','平均スコア'].values[0]:.2f}",
-            "plan_avg": f"{df.loc[df['カテゴリ']=='生産計画・変動対応','平均スコア'].values[0]:.2f}",
-            "dx_avg": f"{df.loc[df['カテゴリ']=='DX・情報共有','平均スコア'].values[0]:.2f}",
-            "ai_comment": st.session_state["ai_comment"] or ""
-        }
-
-        col1, col2 = st.columns(2)
-        if col1.button("Google Sheetsに保存"):
-            try:
-                if sheet_id and json_text:
-                    try_append_to_google_sheets(row, sheet_id, json_text)
-                    st.success("Google Sheetsに保存しました。")
-                else:
-                    st.warning("スプレッドシートID と サービスアカウントJSON を入力してください。")
-            except Exception as e:
-                st.error(f"Sheets保存でエラー：{e}")
-
-        if col2.button("CSVに保存（responses.csv）"):
-            try:
-                fallback_append_to_csv(row)
-                st.success("CSVに追記しました（アプリ直下の responses.csv）。")
-            except Exception as e:
-                st.error(f"CSV保存でエラー：{e}")
+    # ===== 自動保存（ここが今回の追加）=====
+    row = {
+        "timestamp": datetime.now(JST).isoformat(timespec="seconds"),
+        "company": company, "email": email,
+        "signal": signal[0], "main_type": main_type,
+        "overall_avg": f"{overall_avg:.2f}",
+        "inv_avg": f"{df.loc[df['カテゴリ']=='在庫・運搬','平均スコア'].values[0]:.2f}",
+        "skills_avg": f"{df.loc[df['カテゴリ']=='人材・技能承継','平均スコア'].values[0]:.2f}",
+        "cost_avg": f"{df.loc[df['カテゴリ']=='原価意識・改善文化','平均スコア'].values[0]:.2f}",
+        "plan_avg": f"{df.loc[df['カテゴリ']=='生産計画・変動対応','平均スコア'].values[0]:.2f}",
+        "dx_avg": f"{df.loc[df['カテゴリ']=='DX・情報共有','平均スコア'].values[0]:.2f}",
+        "ai_comment": st.session_state["ai_comment"] or "",
+        "utm_source": st.session_state["utm_source"],
+        "utm_medium": st.session_state["utm_medium"],
+        "utm_campaign": st.session_state["utm_campaign"],
+    }
+    auto_save_row(row)
 
 else:
     st.caption("フォームに回答し、「診断する」を押してください。")
+
 
 
 
